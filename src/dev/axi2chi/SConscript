@@ -1,0 +1,8 @@
+Import('*')
+
+SimObject('AXI2CHIBridge.py', sim_objects=['AXI2CHIBridge'])
+
+Source('AXI2CHIBridge.cc')
+Source('TransactionScheduler.cc')
+
+DebugFlag('AXI2CHIBridge', 'AXI-to-CHI protocol bridge debug messages')
