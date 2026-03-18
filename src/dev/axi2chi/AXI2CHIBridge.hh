@@ -87,21 +87,38 @@ class AXI2CHIBridge : public ClockedObject
         unsigned totalSize;        // 总传输字节数
         bool isWrite;              // 读/写标记
 
-        unsigned chiReqCount;      // 拆分后的 CHI 请求数
+        // 目标 CHI 请求数（不是“已发出”的数量）。当 TxnID/队列资源不足时，
+        // 拆分可能被分多次完成，chiReqCount 用于判断事务何时可以完成。
+        unsigned chiReqCount;
+        unsigned chiReqIssued;     // 已发出的 CHI 请求数（用于拆分恢复/调试）
         unsigned chiRespCount;     // 已收到的 CHI 响应数
         bool completed;            // 所有 CHI 响应已收到
+
+        // 拆分恢复状态：当 TxnID 耗尽或请求队列满时，拆分会暂停，等待资源释放后继续。
+        enum class SplitStrategy : uint8_t { Naive, Baseline, CNBA };
+        SplitStrategy splitStrategy;
+        bool splitInitialized;
+        Addr splitNextAddr;        // 下一段要生成 CHI 请求的地址
+        unsigned splitRemaining;   // 还未转换成 CHI 的字节数
+        unsigned splitChunkSize;   // 每个 CHI 请求覆盖的“步长”（Naive/Baseline=beat或64，CNBA=64）
+        bool splitUseByteEnable;   // true: 固定 splitChunkSize 请求 + byte-enable 掩码(剩余不足时)
 
         // QoS 优先级 (CNBA 模式)
         unsigned qosPriority;      // 0=低, 1=高
 
         Tick arrivalTick;          // 到达时间 (用于延迟统计)
+        bool countedForLimit;      // 是否属于 max_axi_requests 统计窗口
 
         AXITransaction()
             : origPkt(nullptr), startAddr(0), endAddr(0),
               burstLen(1), burstSize(1), burstType(BURST_INCR),
               totalSize(0), isWrite(false),
-              chiReqCount(0), chiRespCount(0), completed(false),
-              qosPriority(0), arrivalTick(0)
+              chiReqCount(0), chiReqIssued(0), chiRespCount(0), completed(false),
+              splitStrategy(SplitStrategy::Baseline),
+              splitInitialized(false),
+              splitNextAddr(0), splitRemaining(0),
+              splitChunkSize(0), splitUseByteEnable(false),
+              qosPriority(0), arrivalTick(0), countedForLimit(false)
         {}
     };
 
@@ -180,10 +197,12 @@ class AXI2CHIBridge : public ClockedObject
     const bool qosEnabled;          // 是否开启 QoS 调度
     const unsigned cacheLineSize;   // Cache Line 大小 (默认 64B)
     const unsigned axiBeatSize;     // AXI 每beat字节数
-    const bool randomAxiBeatSize;   // 是否随机化 beat 大小 (加权: 10% 8B, 15% 16B, 75% 32B)
+    const bool randomAxiBeatSize;   // 是否随机化 beat 大小
+    const unsigned minAxiSize;       // 随机 AxSIZE 最小值 (0..5)
     const unsigned maxAxiRequests;  // 接收多少个 AXI 请求后结束仿真 (0=不限)
     const unsigned maxTxnId;        // 最大 CHI TxnID 数量 (默认 128)
     const Cycles bridgeLatency;     // 桥接处理延迟
+    const Cycles convertTime;       // 事务转换延迟 (从接收到开始发送的周期数, 默认 5)
     const unsigned reqQueueSize;    // 请求队列深度
     const unsigned respQueueSize;   // 响应队列深度
     const AddrRangeList addrRanges; // 地址范围
@@ -213,6 +232,8 @@ class AXI2CHIBridge : public ClockedObject
 
     // 待发送的 AXI 响应队列
     std::deque<PacketPtr> axiRespQueue;
+    std::deque<bool> axiRespIsCounted;
+    unsigned pendingCountedAxiResponses;
 
     // 是否因为某种原因正在暂停接收
     bool blocked;
@@ -221,6 +242,8 @@ class AXI2CHIBridge : public ClockedObject
     // 当 sendTimingReq/Resp 失败后设为 true，收到 retry 后清除
     bool chiWaitingForRetry;
     bool axiWaitingForRetry;
+    bool requestLimitReached;
+    bool drainExitIssued;
 
     // ================================================================
     // QoS 调度器 (CNBA 模式)
@@ -261,19 +284,19 @@ class AXI2CHIBridge : public ClockedObject
      * 基准模式: 固定拆分 AXI burst 为 CHI 事务。
      * Ref: CF'20 Paper Section 3 - Transaction Translation
      */
-    void baselineSplitTransaction(AXITransaction &txn);
+    void baselineSplitTransaction(unsigned axiId, AXITransaction &txn);
 
     /**
      * CNBA 模式: 动态聚合/拆分。
      * Ref: CNBA Proposal - 动态事务聚合/拆分算法
      */
-    void cnbaSplitMergeTransaction(AXITransaction &txn);
+    void cnbaSplitMergeTransaction(unsigned axiId, AXITransaction &txn);
 
     /**
      * 朴素桥模式: 逐 beat 拆分，一条 AXI 请求拆成 Len+1 条 CHI 请求。
      * 不考虑 Cache Line 边界对齐，不合并，每个 beat 独立发送。
      */
-    void naiveSplitTransaction(AXITransaction &txn);
+    void naiveSplitTransaction(unsigned axiId, AXITransaction &txn);
 
     /**
      * CNBA 地址对齐算法: 计算跨 Cache Line 的拆分数量。
@@ -293,6 +316,12 @@ class AXI2CHIBridge : public ClockedObject
      * 从 QoS 队列中选取下一个要发送的请求 (WRR 仲裁)。
      */
     bool scheduleNextCHIRequest();
+
+    /**
+     * 返回当前待发送 CHI 请求中最早可发送的时间戳。
+     * 若无请求则返回 MaxTick。
+     */
+    Tick nextReadyCHITick() const;
 
     /**
      * 尝试发送 CHI 请求队列头部的请求。
@@ -318,6 +347,18 @@ class AXI2CHIBridge : public ClockedObject
      * 检查是否因 TxnID 耗尽或队列满而阻塞。
      */
     bool isBlocked() const;
+
+    /**
+     * 检查是否满足“达到请求上限后已完全排空”的退出条件。
+     * 条件满足时触发 exitSimLoop。
+     */
+    void checkDrainAndExit();
+
+    // ---- 拆分恢复与阻塞管理 ----
+    size_t pendingChiReqs() const;
+    void issueMoreCHIRequests(unsigned axiId, AXITransaction &txn);
+    void resumePendingSplits();
+    void maybeUnblockAxi();
 
     /**
      * 计算 AXI WRAP 突发的实际地址序列。

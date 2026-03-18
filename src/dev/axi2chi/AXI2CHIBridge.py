@@ -18,9 +18,9 @@ class AXI2CHIBridge(ClockedObject):
 
     可配置为三种工作模式:
     - Baseline (CF'20 Paper): use_baseline_logic=True
-      → 固定按 64B Cache Line 边界拆分, max_txn_id=128, 无合并
+      → Size<5 按 beat 拆分, Size==5 合并成 64B CHI, 无合并优化
     - CNBA (本设计):          use_baseline_logic=False, enable_merge_split=True
-      → 动态聚合/拆分 + QoS 调度, max_txn_id=256
+      → 任意 Size 统一拆成 64B CHI (Size==6), 可选 QoS 调度
     - Naive (朴素桥):         use_naive_logic=True
       → 逐 beat 拆分 (一条 AXI→Len+1 条 CHI), 无 CL 对齐, 无合并
 
@@ -64,25 +64,34 @@ class AXI2CHIBridge(ClockedObject):
     )
     random_axi_beat_size = Param.Bool(
         False,
-        "Randomize AXI beat size per request (weighted: 10% 8B, 15% 16B, 75% 32B)",
+        "Randomize AXI beat size per request (AxSIZE in [min..5], 1/2/4/8/16/32B)",
+    )
+    min_axi_size = Param.Unsigned(
+        3,
+        "Minimum AxSIZE value for random beat size (0=1B .. 5=32B, default 3=8B)",
     )
     max_axi_requests = Param.Unsigned(
         0,
-        "Stop simulation after receiving this many AXI requests (0 = unlimited)",
+        "Stop after receiving this many AXI requests and draining all in-flight "
+        "transactions/queues (0 = unlimited)",
     )
     max_txn_id = Param.Unsigned(
-        128,
-        "Maximum number of outstanding TxnIDs "
-        "(CF'20 baseline uses 128, CNBA uses 128)",
+        32,
+        "Maximum number of outstanding TxnIDs (all modes share this limit)",
     )
     bridge_latency = Param.Cycles(1, "Bridge crossing latency in cycles")
+    convert_time = Param.Cycles(
+        5,
+        "Transaction conversion latency in cycles "
+        "(delay from AXI request to start CHI request sending)",
+    )
 
     # ---- 队列大小 ----
     req_queue_size = Param.Unsigned(
-        32, "Maximum number of CHI requests that can be buffered"
+        1024, "Maximum number of CHI requests that can be buffered"
     )
     resp_queue_size = Param.Unsigned(
-        32, "Maximum number of AXI responses that can be buffered"
+        1024, "Maximum number of AXI responses that can be buffered"
     )
 
     # ---- 地址范围 ----

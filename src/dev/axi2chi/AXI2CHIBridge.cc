@@ -36,8 +36,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <limits>
 
 #include "base/logging.hh"
+#include "base/random.hh"
 #include "base/trace.hh"
 #include "debug/AXI2CHIBridge.hh"
 #include "sim/cur_tick.hh"
@@ -64,9 +67,11 @@ AXI2CHIBridge::AXI2CHIBridge(const Params &p)
       cacheLineSize(p.cache_line_size),
       axiBeatSize(p.axi_beat_size),
       randomAxiBeatSize(p.random_axi_beat_size),
+      minAxiSize(p.min_axi_size),
       maxAxiRequests(p.max_axi_requests),
       maxTxnId(p.max_txn_id),
       bridgeLatency(p.bridge_latency),
+      convertTime(p.convert_time),
       reqQueueSize(p.req_queue_size),
       respQueueSize(p.resp_queue_size),
       addrRanges(p.ranges.begin(), p.ranges.end()),
@@ -76,6 +81,9 @@ AXI2CHIBridge::AXI2CHIBridge(const Params &p)
       blocked(false),
       chiWaitingForRetry(false),
       axiWaitingForRetry(false),
+      requestLimitReached(false),
+      drainExitIssued(false),
+      pendingCountedAxiResponses(0),
       // QoS 调度器
       wrrHighWeight(p.wrr_high_weight),
       wrrLowWeight(p.wrr_low_weight),
@@ -98,11 +106,12 @@ AXI2CHIBridge::AXI2CHIBridge(const Params &p)
 
     DPRINTF(AXI2CHIBridge,
             "AXI2CHIBridge created: mode=%s, merge_split=%d, "
-            "qos=%d, cache_line=%dB, axi_beat=%dB, max_txn=%d\n",
+            "qos=%d, cache_line=%dB, axi_beat=%dB, max_txn=%d, "
+            "convert_time=%d cycles\n",
             useNaiveLogic ? "Naive" :
                 (useBaselineLogic ? "Baseline(CF'20)" : "CNBA"),
             enableMergeSplit, qosEnabled, cacheLineSize,
-            axiBeatSize, maxTxnId);
+            axiBeatSize, maxTxnId, convertTime);
 }
 
 // ====================================================================
@@ -254,6 +263,15 @@ AXI2CHIBridge::CHIMasterPort::recvReqRetry()
 bool
 AXI2CHIBridge::handleAXIRequest(PacketPtr pkt)
 {
+    if (maxAxiRequests > 0 &&
+        stats.totalAxiRequests.value() >= maxAxiRequests) {
+        requestLimitReached = true;
+        // 达到请求上限后拒绝新请求, 等待已计数事务排空
+        // 返回 false 使 TrafficGen 停止发送
+        blocked = true;
+        return false;
+    }
+
     // Step 1: 检查是否被阻塞
     if (isBlocked()) {
         DPRINTF(AXI2CHIBridge,
@@ -275,17 +293,11 @@ AXI2CHIBridge::handleAXIRequest(PacketPtr pkt)
 
     // 从 packet size 推导 AXI burst 参数
     // burstSize = 每个 AXI beat 的字节数 = 2^AxSIZE
-    // 随机模式下加权选择: 10% 8B, 15% 16B, 75% 32B
+    // 随机模式下 AxSIZE 在 [0, 5] 内均匀随机 (1/2/4/8/16/32B)
     unsigned effectiveBeat;
     if (randomAxiBeatSize) {
-        // 20 个槽位: 2×8B(10%) + 3×16B(15%) + 15×32B(75%)
-        static const unsigned BEAT_TABLE[] = {
-            8, 8,                                       // 10%
-            16, 16, 16,                                 // 15%
-            32, 32, 32, 32, 32, 32, 32, 32,            // 75%
-            32, 32, 32, 32, 32, 32, 32
-        };
-        effectiveBeat = BEAT_TABLE[nextAxiTxnId % 20];
+        unsigned axiSize = random_mt.random<unsigned>(minAxiSize, 5);
+        effectiveBeat = 1U << axiSize;
     } else {
         effectiveBeat = axiBeatSize;
     }
@@ -304,20 +316,28 @@ AXI2CHIBridge::handleAXIRequest(PacketPtr pkt)
     // 分配内部事务 ID
     unsigned axiId = nextAxiTxnId++;
     axiTransactions[axiId] = txn;
+    AXITransaction &storedTxn = axiTransactions[axiId];
+
+    const bool countThisTxn =
+        (maxAxiRequests == 0) ||
+        (stats.totalAxiRequests.value() < maxAxiRequests);
+    storedTxn.countedForLimit = countThisTxn;
 
     // 统计
-    stats.totalAxiRequests++;
-    if (txn.isWrite)
-        stats.totalWrites++;
-    else
-        stats.totalReads++;
+    if (countThisTxn) {
+        stats.totalAxiRequests++;
+        stats.totalBytes += storedTxn.totalSize;
+        pendingCountedAxiResponses++;
+        if (storedTxn.isWrite)
+            stats.totalWrites++;
+        else
+            stats.totalReads++;
+    }
 
-    stats.totalBytes += txn.totalSize;
-
-    // 达到最大 AXI 请求数后停止仿真
-    if (maxAxiRequests > 0 &&
+    // 达到最大 AXI 请求数后进入 drain 阶段: 等待统计窗口事务排空后退出
+    if (maxAxiRequests > 0 && !requestLimitReached &&
         stats.totalAxiRequests.value() >= maxAxiRequests) {
-        exitSimLoop("AXI request limit reached");
+        requestLimitReached = true;
     }
 
     DPRINTF(AXI2CHIBridge,
@@ -330,26 +350,30 @@ AXI2CHIBridge::handleAXIRequest(PacketPtr pkt)
     // Step 3: 根据模式选择事务转换策略
     if (useNaiveLogic) {
         // ---- 朴素桥模式: 逐 beat 拆分 ----
-        naiveSplitTransaction(axiTransactions[axiId]);
+        naiveSplitTransaction(axiId, storedTxn);
     } else if (useBaselineLogic) {
         // ---- 基准模式 (CF'20 Paper Logic) ----
-        baselineSplitTransaction(axiTransactions[axiId]);
+        baselineSplitTransaction(axiId, storedTxn);
     } else {
         // ---- CNBA 模式 (本设计 Logic) ----
         if (enableMergeSplit) {
-            cnbaSplitMergeTransaction(axiTransactions[axiId]);
+            cnbaSplitMergeTransaction(axiId, storedTxn);
         } else {
             // 消融实验: CNBA 架构但关闭合并, 仅做拆分
-            baselineSplitTransaction(axiTransactions[axiId]);
+            baselineSplitTransaction(axiId, storedTxn);
         }
     }
 
     // Step 4: 调度 CHI 请求发送
-    if (!chiWaitingForRetry && !sendCHIReqEvent.scheduled() &&
-        !chiReqQueue.empty()) {
-        schedule(sendCHIReqEvent, clockEdge(bridgeLatency));
+    if (!chiWaitingForRetry && !sendCHIReqEvent.scheduled()) {
+        // 使用每条请求的 scheduledTick 控制转换延迟
+        Tick next_ready = nextReadyCHITick();
+        if (next_ready != MaxTick) {
+            schedule(sendCHIReqEvent, std::max(next_ready, curTick()));
+        }
     }
 
+    checkDrainAndExit();
     return true;
 }
 
@@ -361,119 +385,47 @@ AXI2CHIBridge::handleAXIRequest(PacketPtr pkt)
 /**
  * baselineSplitTransaction:
  *
- * CF'20 论文的核心逻辑 —— 收到一个 AXI Burst 后，
- * 强制按 Cache Line (64B) 拆分为多个 CHI 请求。
- * 不进行任何合并优化。
+ * Baseline 模式的核心逻辑:
+ * - AxSIZE < 5 (beat < 32B): 逐 beat 拆分，每个 beat → 1 个 CHI 请求
+ * - AxSIZE == 5 (beat == 32B): 合并为 Size==6 (64B) 的 CHI 请求
+ *   (Size==6 在 CHI 中表示 2^6 = 64B = 2 个顺序 beat)
  *
- * 每个 CHI 请求消耗一个 TxnID，当 TxnID 达到 max_txn_id
- * (论文中为 128) 时，新请求被阻塞。
- *
- * Ref: CF'20 Paper Section 3.1 - "Each AXI beat that crosses
- *      a cache line boundary generates a separate CHI transaction"
- *
- * ============================================================
- * 窄拍处理 (AxSIZE < 5, per-beat < 32B):
- *   CF'20 桥仅在 AXI 每拍 >= 32B 时才做 CL 对齐拆分。
- *   当 AxSIZE < 5 (每拍 < 32B) 时，硬件无法有效地将窄拍
- *   合并为 CL 大小的 CHI 请求，因此每个 AXI beat 独立映射
- *   为一个 CHI 请求 (共 Len+1 个)。
- *
- *   示例 (axiBeatSize=16B, 总大小=128B):
- *     宽拍路径 (>=32B): 128B ÷ 64B = 2 个 CL 对齐的 CHI
- *     窄拍路径 (<32B):  128B ÷ 16B = 8 个逐拍 CHI 请求
+ * 这是比 Naive 更智能的策略，但仍不如 CNBA。
  */
 void
-AXI2CHIBridge::baselineSplitTransaction(AXITransaction &txn)
+AXI2CHIBridge::baselineSplitTransaction(unsigned axiId, AXITransaction &txn)
 {
-    Addr addr = txn.startAddr;
-    unsigned remaining = txn.totalSize;
-    unsigned chiCount = 0;
+    unsigned beatSize = txn.burstSize;
+    if (beatSize == 0) beatSize = 1;
 
-    // 判断是否为窄拍: 每拍字节数 < 32B (即 AxSIZE < 5)
-    // txn.burstSize 已在 handleAXIRequest 中计算好（含随机化）
-    unsigned effectiveBeatSize = txn.burstSize;
-    if (effectiveBeatSize == 0) effectiveBeatSize = 1;
-    bool narrowBeat = (effectiveBeatSize < 32);
+    // 判断是否为宽拍 (AxSIZE == 5，即 beatSize == 32B)
+    bool wideBeat = (beatSize == 32);
 
-    while (remaining > 0) {
-        unsigned thisSize;
+    if (!txn.splitInitialized) {
+        txn.splitInitialized = true;
+        txn.splitStrategy = AXITransaction::SplitStrategy::Baseline;
+        txn.chiReqIssued = 0;
+        txn.chiRespCount = 0;
 
-        if (narrowBeat) {
-            // 窄拍路径 (AxSIZE < 5): 每拍 → 1 个 CHI 请求
-            // 不按 CL 边界对齐，直接按 beat 大小切割
-            thisSize = std::min(effectiveBeatSize, remaining);
+        txn.splitNextAddr = txn.startAddr;
+        txn.splitRemaining = txn.totalSize;
+
+        if (wideBeat) {
+            txn.splitChunkSize = 64U;
+            txn.splitUseByteEnable = true;
         } else {
-            // 宽拍路径 (AxSIZE >= 5): 按 Cache Line 边界对齐拆分
-            Addr lineStart = addr & ~(Addr)(cacheLineSize - 1);
-            Addr lineEnd = lineStart + cacheLineSize;
-            thisSize = std::min((unsigned)(lineEnd - addr), remaining);
+            txn.splitChunkSize = beatSize;
+            txn.splitUseByteEnable = false;
         }
 
-        // 分配 TxnID
-        int txnId = allocateTxnId();
-        if (txnId < 0) {
-            // TxnID 耗尽，阻塞
-            // Ref: CF'20 Paper - "performance degrades when TxnIDs
-            //       are exhausted under high memory latency"
-            DPRINTF(AXI2CHIBridge,
-                    "TxnID exhausted! Stalling (baseline mode).\n");
-            stats.robStallCycles++;
-            blocked = true;
-            break;
+        txn.chiReqCount =
+            (txn.totalSize + txn.splitChunkSize - 1) / txn.splitChunkSize;
+        if (txn.chiReqCount > 1) {
+            stats.splitCount++;
         }
-
-        // 创建 CHI 请求包
-        // 使用 gem5 的 MemCmd 区分读写和一致性类型
-        MemCmd cmd = txn.isWrite ? MemCmd::WriteReq : MemCmd::ReadReq;
-        RequestPtr req = std::make_shared<Request>(
-            addr, thisSize, Request::Flags(0),
-            txn.origPkt->req->requestorId());
-        PacketPtr chiPkt = new Packet(req, cmd);
-        chiPkt->allocate();
-
-        // 将 TxnID 附加到包上，响应时用于释放
-        chiPkt->pushSenderState(
-            new CHISenderState(txnId, 0));  // parentAxiId TBD
-
-        // 如果是写请求，复制数据
-        if (txn.isWrite && txn.origPkt->hasData()) {
-            unsigned offset = addr - txn.startAddr;
-            if (offset + thisSize <= txn.origPkt->getSize()) {
-                chiPkt->setData(txn.origPkt->getConstPtr<uint8_t>() + offset);
-            }
-        }
-
-        // 构建 CHI 请求记录
-        CHIRequest chiReq;
-        chiReq.pkt = chiPkt;
-        chiReq.txnId = txnId;
-        chiReq.scheduledTick = curTick();
-
-        // 加入队列 (基准模式不区分优先级)
-        chiReqQueue.push_back(chiReq);
-        chiCount++;
-
-        DPRINTF(AXI2CHIBridge,
-                "  Baseline split: CHI req addr=%#x, size=%d, txnId=%d, %s\n",
-                addr, thisSize, txnId,
-                narrowBeat ? "narrow-beat" : "CL-aligned");
-
-        addr += thisSize;
-        remaining -= thisSize;
     }
 
-    txn.chiReqCount = chiCount;
-    stats.totalChiRequests += chiCount;
-
-    // 如果拆分了 (chiCount > 1)，记录拆分统计
-    if (chiCount > 1) {
-        stats.splitCount++;
-    }
-
-    DPRINTF(AXI2CHIBridge,
-            "Baseline: AXI burst(%dB, beatSize=%dB, %s) -> %d CHI requests\n",
-            txn.totalSize, effectiveBeatSize,
-            narrowBeat ? "narrow" : "wide", chiCount);
+    issueMoreCHIRequests(axiId, txn);
 }
 
 // ====================================================================
@@ -520,74 +472,31 @@ AXI2CHIBridge::baselineSplitTransaction(AXITransaction &txn)
  *   - 作为性能下界 (worst case) 对比使用
  */
 void
-AXI2CHIBridge::naiveSplitTransaction(AXITransaction &txn)
+AXI2CHIBridge::naiveSplitTransaction(unsigned axiId, AXITransaction &txn)
 {
-    Addr addr = txn.startAddr;
-    unsigned remaining = txn.totalSize;
-    unsigned chiCount = 0;
-
     // 每个 beat 的大小: 使用 txn.burstSize（已在 handleAXIRequest 中计算好）
     unsigned beatSize = txn.burstSize;
     if (beatSize == 0) beatSize = 1;
 
-    while (remaining > 0) {
-        unsigned thisSize = std::min(beatSize, remaining);
+    if (!txn.splitInitialized) {
+        txn.splitInitialized = true;
+        txn.splitStrategy = AXITransaction::SplitStrategy::Naive;
+        txn.chiReqIssued = 0;
+        txn.chiRespCount = 0;
 
-        // 分配 TxnID
-        int txnId = allocateTxnId();
-        if (txnId < 0) {
-            DPRINTF(AXI2CHIBridge,
-                    "TxnID exhausted! Stalling (naive mode).\n");
-            stats.robStallCycles++;
-            blocked = true;
-            break;
+        txn.splitNextAddr = txn.startAddr;
+        txn.splitRemaining = txn.totalSize;
+        txn.splitChunkSize = beatSize;
+        txn.splitUseByteEnable = false;
+
+        txn.chiReqCount =
+            (txn.totalSize + txn.splitChunkSize - 1) / txn.splitChunkSize;
+        if (txn.chiReqCount > 1) {
+            stats.splitCount++;
         }
-
-        // 创建 CHI 请求包
-        MemCmd cmd = txn.isWrite ? MemCmd::WriteReq : MemCmd::ReadReq;
-        RequestPtr req = std::make_shared<Request>(
-            addr, thisSize, Request::Flags(0),
-            txn.origPkt->req->requestorId());
-        PacketPtr chiPkt = new Packet(req, cmd);
-        chiPkt->allocate();
-
-        chiPkt->pushSenderState(
-            new CHISenderState(txnId, 0));
-
-        // 写请求复制数据
-        if (txn.isWrite && txn.origPkt->hasData()) {
-            unsigned offset = addr - txn.startAddr;
-            if (offset + thisSize <= txn.origPkt->getSize()) {
-                chiPkt->setData(txn.origPkt->getConstPtr<uint8_t>() + offset);
-            }
-        }
-
-        CHIRequest chiReq;
-        chiReq.pkt = chiPkt;
-        chiReq.txnId = txnId;
-        chiReq.scheduledTick = curTick();
-
-        chiReqQueue.push_back(chiReq);
-        chiCount++;
-
-        DPRINTF(AXI2CHIBridge,
-                "  Naive split: CHI req addr=%#x, size=%d, txnId=%d\n",
-                addr, thisSize, txnId);
-
-        addr += thisSize;
-        remaining -= thisSize;
     }
 
-    txn.chiReqCount = chiCount;
-    stats.totalChiRequests += chiCount;
-
-    if (chiCount > 1) {
-        stats.splitCount++;
-    }
-
-    DPRINTF(AXI2CHIBridge,
-            "Naive: AXI burst(%dB, beatSize=%dB) -> %d CHI requests\n",
-            txn.totalSize, beatSize, chiCount);
+    issueMoreCHIRequests(axiId, txn);
 }
 
 // ====================================================================
@@ -598,149 +507,192 @@ AXI2CHIBridge::naiveSplitTransaction(AXITransaction &txn)
 /**
  * cnbaSplitMergeTransaction:
  *
- * CNBA 核心算法 —— 智能判断是否需要拆分或合并:
+ * CNBA 核心算法 —— 最高效率的拆分:
+ * 无论 AxSIZE 为多大，都将所有 AXI 请求拆分为 Size==6 (64B) 的 CHI 请求。
+ * 这是最优的缓存行对齐策略，能最小化 CHI 请求数量。
  *
- * 1. 地址对齐检测: 检查起始地址是否对齐到 Cache Line 边界
- * 2. 跨行智能切分: 若 AXI Burst 跨越 Cache Line 边界，自动拆分
- * 3. 事务合并: 若请求 Size < Cache Line，可合并为一个 CHI 请求
+ * 算法:
+ *   - 将 totalSize 的数据分割成多个 64B 块
+ *   - 每个块生成 1 个 CHI Size==6 请求
+ *   - 若最后不足 64B, 仍发送 64B 请求并设置 byte-enable
  *
- * 拆分数量计算公式:
- *   num = (end_addr >> log2(cacheLineSize))
- *       - (start_addr >> log2(cacheLineSize))
- * Ref: CNBA Proposal + Chisel/Verilog 源码
+ * 性能优势:
+ *   - CHI 请求数最少 → TxnID 消耗最低
+ *   - 完全按 Cache Line 对齐 → 下游内存效率最高
+ *   - ROB stall 最低
  */
 void
-AXI2CHIBridge::cnbaSplitMergeTransaction(AXITransaction &txn)
+AXI2CHIBridge::cnbaSplitMergeTransaction(unsigned axiId,
+                                         AXITransaction &txn)
 {
-    unsigned chiCount = 0;
-    unsigned pageBits = (unsigned)std::log2(cacheLineSize);
+    if (!txn.splitInitialized) {
+        txn.splitInitialized = true;
+        txn.splitStrategy = AXITransaction::SplitStrategy::CNBA;
+        txn.chiReqIssued = 0;
+        txn.chiRespCount = 0;
 
-    // Step 1: 计算需要拆分的数量
-    // Ref: CNBA 公式 num = (end_addr >> page_bits) - (start_addr >> page_bits)
-    unsigned splitNum = calcSplitCount(txn.startAddr, txn.endAddr,
-                                       cacheLineSize);
+        txn.splitNextAddr = txn.startAddr;
+        txn.splitRemaining = txn.totalSize;
+        txn.splitChunkSize = 64U;
+        txn.splitUseByteEnable = true;
 
-    DPRINTF(AXI2CHIBridge,
-            "CNBA: addr=%#x~%#x, totalSize=%d, splitNum=%d\n",
-            txn.startAddr, txn.endAddr, txn.totalSize, splitNum);
+        txn.chiReqCount =
+            (txn.totalSize + txn.splitChunkSize - 1) / txn.splitChunkSize;
 
-    if (splitNum == 0) {
-        // ---- 事务合并: 请求不跨 Cache Line，可整体发送 ----
-        // Ref: CNBA - 事务合并逻辑
+        // mergeCount: 相比朴素逐beat拆分节省的 CHI 请求数
+        unsigned naiveCount = txn.burstLen;  // Len+1 个 CHI 请求 (朴素桥)
+        if (txn.chiReqCount < naiveCount) {
+            stats.mergeCount += (naiveCount - txn.chiReqCount);
+        }
+        if (txn.chiReqCount > 1) {
+            stats.splitCount++;
+        }
+    }
+
+    issueMoreCHIRequests(axiId, txn);
+}
+
+size_t
+AXI2CHIBridge::pendingChiReqs() const
+{
+    return chiReqQueue.size() + highPrioQueue.size() + lowPrioQueue.size();
+}
+
+void
+AXI2CHIBridge::issueMoreCHIRequests(unsigned axiId, AXITransaction &txn)
+{
+    bool progress = false;
+
+    while (txn.splitRemaining > 0) {
         int txnId = allocateTxnId();
         if (txnId < 0) {
+            DPRINTF(AXI2CHIBridge,
+                    "TxnID exhausted! Stalling pending split for AXI txn[%u].\n",
+                    axiId);
             stats.robStallCycles++;
             blocked = true;
-            return;
+            break;
         }
+
+        const Addr addr = txn.splitNextAddr;
+        const unsigned chunk = std::max(1U, txn.splitChunkSize);
+        const unsigned remaining = txn.splitRemaining;
+        const unsigned effectiveSize =
+            txn.splitUseByteEnable ? chunk : std::min(chunk, remaining);
 
         MemCmd cmd = txn.isWrite ? MemCmd::WriteReq : MemCmd::ReadReq;
         RequestPtr req = std::make_shared<Request>(
-            txn.startAddr, txn.totalSize, Request::Flags(0),
+            addr, effectiveSize, Request::Flags(0),
             txn.origPkt->req->requestorId());
-        PacketPtr chiPkt = new Packet(req, cmd);
-        chiPkt->allocate();
 
-        // 将 TxnID 附加到包上
-        chiPkt->pushSenderState(
-            new CHISenderState(txnId, 0));
-
-        if (txn.isWrite && txn.origPkt->hasData()) {
-            chiPkt->setData(txn.origPkt->getConstPtr<uint8_t>());
+        if (txn.splitUseByteEnable && remaining < chunk) {
+            std::vector<bool> mask(chunk, false);
+            for (unsigned i = 0; i < remaining; ++i) {
+                mask[i] = true;
+            }
+            req->setByteEnable(mask);
         }
 
+        PacketPtr chiPkt = new Packet(req, cmd);
+        if (txn.isWrite) {
+            if (txn.splitUseByteEnable) {
+                auto *buf = new uint8_t[chunk];
+                std::memset(buf, 0, chunk);
+                unsigned offset = addr - txn.startAddr;
+                unsigned copySize = std::min(remaining, chunk);
+                if (txn.origPkt->hasData() &&
+                    offset + copySize <= txn.origPkt->getSize()) {
+                    std::memcpy(buf,
+                                txn.origPkt->getConstPtr<uint8_t>() + offset,
+                                copySize);
+                }
+                chiPkt->dataDynamic(buf);
+            } else {
+                chiPkt->allocate();
+                if (txn.origPkt->hasData()) {
+                    unsigned offset = addr - txn.startAddr;
+                    if (offset + effectiveSize <= txn.origPkt->getSize()) {
+                        chiPkt->setData(
+                            txn.origPkt->getConstPtr<uint8_t>() + offset);
+                    }
+                }
+            }
+        } else {
+            chiPkt->allocate();
+        }
+
+        chiPkt->pushSenderState(new CHISenderState(txnId, axiId));
+
+        // 每个 CHI 请求按顺序发送：第 N 个 CHI 请求在 convertTime + N 周期后发出
         CHIRequest chiReq;
         chiReq.pkt = chiPkt;
         chiReq.txnId = txnId;
+        chiReq.parentAxiId = axiId;
+        chiReq.scheduledTick = clockEdge(
+            convertTime + Cycles(txn.chiReqIssued));
 
-        // QoS: 按优先级入队
-        if (qosEnabled) {
+        if (txn.splitStrategy == AXITransaction::SplitStrategy::CNBA &&
+            qosEnabled) {
             enqueueCHIRequest(chiReq, txn.qosPriority);
         } else {
             chiReqQueue.push_back(chiReq);
         }
 
-        chiCount = 1;
-        stats.mergeCount++;
+        txn.chiReqIssued++;
+        stats.totalChiRequests++;
+        progress = true;
 
-        DPRINTF(AXI2CHIBridge,
-                "  CNBA merged: single CHI req addr=%#x, size=%d, "
-                "txnId=%d\n",
-                txn.startAddr, txn.totalSize, txnId);
-
-    } else {
-        // ---- 智能拆分: 按 Cache Line 边界拆分 ----
-        // Ref: CNBA - 跨行智能切分
-        Addr addr = txn.startAddr;
-        unsigned remaining = txn.totalSize;
-
-        while (remaining > 0) {
-            Addr lineStart = addr & ~(Addr)(cacheLineSize - 1);
-            Addr lineEnd = lineStart + cacheLineSize;
-            unsigned thisSize = std::min((unsigned)(lineEnd - addr),
-                                        remaining);
-
-            int txnId = allocateTxnId();
-            if (txnId < 0) {
-                stats.robStallCycles++;
-                blocked = true;
-                break;
-            }
-
-            MemCmd cmd = txn.isWrite ? MemCmd::WriteReq : MemCmd::ReadReq;
-            RequestPtr req = std::make_shared<Request>(
-                addr, thisSize, Request::Flags(0),
-                txn.origPkt->req->requestorId());
-            PacketPtr chiPkt = new Packet(req, cmd);
-            chiPkt->allocate();
-
-            // 将 TxnID 附加到包上
-            chiPkt->pushSenderState(
-                new CHISenderState(txnId, 0));
-
-            if (txn.isWrite && txn.origPkt->hasData()) {
-                unsigned offset = addr - txn.startAddr;
-                if (offset + thisSize <= txn.origPkt->getSize()) {
-                    chiPkt->setData(
-                        txn.origPkt->getConstPtr<uint8_t>() + offset);
-                }
-            }
-
-            CHIRequest chiReq;
-            chiReq.pkt = chiPkt;
-            chiReq.txnId = txnId;
-
-            if (qosEnabled) {
-                enqueueCHIRequest(chiReq, txn.qosPriority);
-            } else {
-                chiReqQueue.push_back(chiReq);
-            }
-
-            chiCount++;
-
-            DPRINTF(AXI2CHIBridge,
-                    "  CNBA split [%d]: CHI req addr=%#x, size=%d, "
-                    "txnId=%d\n",
-                    chiCount, addr, thisSize, txnId);
-
-            addr += thisSize;
-            remaining -= thisSize;
-        }
-
-        if (chiCount > 1) {
-            stats.splitCount++;
-        }
+        const unsigned advance = std::min(chunk, remaining);
+        txn.splitNextAddr += advance;
+        txn.splitRemaining -= advance;
     }
 
-    txn.chiReqCount = chiCount;
-    stats.totalChiRequests += chiCount;
+    if (progress) {
+        DPRINTF(AXI2CHIBridge,
+                "AXI txn[%u] issued %u/%u CHI reqs, remaining=%u\n",
+                axiId, txn.chiReqIssued, txn.chiReqCount, txn.splitRemaining);
 
-    DPRINTF(AXI2CHIBridge,
-            "CNBA: AXI burst(%dB) -> %d CHI requests "
-            "(merged=%s, split=%s)\n",
-            txn.totalSize, chiCount,
-            (splitNum == 0) ? "yes" : "no",
-            (chiCount > 1) ? "yes" : "no");
+        // 拆分恢复可能发生在 CHI 响应回调中：此时不一定已经调度 sendCHIReqEvent。
+        if (!chiWaitingForRetry && !sendCHIReqEvent.scheduled()) {
+            Tick next_ready = nextReadyCHITick();
+            if (next_ready != MaxTick) {
+                schedule(sendCHIReqEvent, std::max(next_ready, curTick()));
+            }
+        }
+    }
+}
+
+void
+AXI2CHIBridge::resumePendingSplits()
+{
+    if (isBlocked()) {
+        return;
+    }
+
+    for (auto &kv : axiTransactions) {
+        auto &txn = kv.second;
+        if (!txn.splitInitialized || txn.completed || txn.splitRemaining == 0) {
+            continue;
+        }
+        issueMoreCHIRequests(kv.first, txn);
+        if (isBlocked()) {
+            break;
+        }
+    }
+}
+
+void
+AXI2CHIBridge::maybeUnblockAxi()
+{
+    if (blocked && !isBlocked()) {
+        blocked = false;
+        if (axiSlavePort.needRetry) {
+            axiSlavePort.needRetry = false;
+            axiSlavePort.sendRetryReq();
+            DPRINTF(AXI2CHIBridge,
+                    "Unblocked: sending retry to AXI upstream\n");
+        }
+    }
 }
 
 // ====================================================================
@@ -781,92 +733,103 @@ AXI2CHIBridge::handleCHIResponse(PacketPtr pkt)
             "CHI response: addr=%#x, %s\n",
             pkt->getAddr(), pkt->isRead() ? "RD" : "WR");
 
-    // 从 SenderState 获取 TxnID 并释放
+    unsigned parentAxiId = std::numeric_limits<unsigned>::max();
+
+    // 从 SenderState 获取 TxnID 和 parentAxiId
     auto *ss = dynamic_cast<CHISenderState*>(pkt->popSenderState());
     if (ss) {
         freeTxnId(ss->txnId);
+        parentAxiId = ss->parentAxiId;
         DPRINTF(AXI2CHIBridge,
-                "  Freed TxnID=%d, active=%d\n",
-                ss->txnId, activeTxnCount);
+                "  Freed TxnID=%d, active=%d, parentAxiId=%d\n",
+                ss->txnId, activeTxnCount, parentAxiId);
         delete ss;
     }
 
-    // 查找对应的 AXI 事务
-    // 简化实现: 遍历找到地址匹配的事务
-    for (auto &[axiId, txn] : axiTransactions) {
-        if (txn.completed)
-            continue;
-
-        // 检查地址范围是否匹配
+    auto processResponse = [&](unsigned axiId, AXITransaction &txn) {
         Addr respAddr = pkt->getAddr();
-        if (respAddr >= txn.startAddr &&
-            respAddr < txn.startAddr + txn.totalSize) {
+        txn.chiRespCount++;
 
-            txn.chiRespCount++;
-
-            // 如果是读请求，将数据复制回原始 AXI 包
-            // 注意: TrafficGen 创建的 ReadReq 已通过 dataDynamic() 分配了数据缓冲，
-            // 不能再调用 allocate()。直接用 getPtr() 写入即可。
-            if (pkt->isRead() && txn.origPkt) {
+        // 如果是读请求，将数据复制回原始 AXI 包
+        if (pkt->isRead() && txn.origPkt) {
+            if (respAddr >= txn.startAddr) {
                 unsigned offset = respAddr - txn.startAddr;
-                unsigned copySize = std::min((unsigned)pkt->getSize(),
-                    txn.totalSize - offset);
-                uint8_t *dstPtr = txn.origPkt->getPtr<uint8_t>();
-                if (dstPtr && pkt->hasData()) {
-                    std::memcpy(dstPtr + offset,
-                                pkt->getConstPtr<uint8_t>(),
-                                copySize);
+                if (offset < txn.totalSize) {
+                    unsigned copySize = std::min((unsigned)pkt->getSize(),
+                        txn.totalSize - offset);
+                    uint8_t *dstPtr = txn.origPkt->getPtr<uint8_t>();
+                    if (dstPtr && pkt->hasData()) {
+                        std::memcpy(dstPtr + offset,
+                                    pkt->getConstPtr<uint8_t>(),
+                                    copySize);
+                    }
                 }
+            }
+        }
+
+        DPRINTF(AXI2CHIBridge,
+                "  AXI txn[%d]: %d/%d CHI responses received\n",
+                axiId, txn.chiRespCount, txn.chiReqCount);
+
+        // 检查是否所有 CHI 响应都已收到
+        if (txn.chiRespCount >= txn.chiReqCount) {
+            txn.completed = true;
+
+            Tick latency = curTick() - txn.arrivalTick;
+            if (txn.countedForLimit) {
+                stats.latencyHist.sample(latency);
+                stats.totalLatency += latency;
+            }
+
+            PacketPtr respPkt = txn.origPkt;
+            respPkt->makeResponse();
+            axiRespQueue.push_back(respPkt);
+            axiRespIsCounted.push_back(txn.countedForLimit);
+
+            if (!axiWaitingForRetry && !sendAXIRespEvent.scheduled()) {
+                schedule(sendAXIRespEvent, clockEdge(Cycles(1)));
             }
 
             DPRINTF(AXI2CHIBridge,
-                    "  AXI txn[%d]: %d/%d CHI responses received\n",
-                    axiId, txn.chiRespCount, txn.chiReqCount);
+                    "  AXI txn[%d] completed, latency=%llu ticks\n",
+                    axiId, latency);
+        }
+    };
 
-            // 检查是否所有 CHI 响应都已收到
-            if (txn.chiRespCount >= txn.chiReqCount) {
-                txn.completed = true;
+    bool matched = false;
+    if (parentAxiId != std::numeric_limits<unsigned>::max()) {
+        auto it = axiTransactions.find(parentAxiId);
+        if (it != axiTransactions.end() && !it->second.completed) {
+            processResponse(parentAxiId, it->second);
+            matched = true;
+        }
+    }
 
-                // 计算延迟统计
-                Tick latency = curTick() - txn.arrivalTick;
-                stats.latencyHist.sample(latency);
-                stats.totalLatency += latency;
-
-                // 生成 AXI 响应
-                // Ref: CF'20 Paper - ROB 确保 AXI 响应按序
-                PacketPtr respPkt = txn.origPkt;
-                respPkt->makeResponse();
-                axiRespQueue.push_back(respPkt);
-
-                // 调度发送 AXI 响应
-                if (!axiWaitingForRetry && !sendAXIRespEvent.scheduled()) {
-                    schedule(sendAXIRespEvent, clockEdge(Cycles(1)));
-                }
-
-                DPRINTF(AXI2CHIBridge,
-                        "  AXI txn[%d] completed, latency=%llu ticks\n",
-                        axiId, latency);
+    // 兼容旧包路径: 如果 sender state 丢失, 回退到地址匹配
+    if (!matched) {
+        Addr respAddr = pkt->getAddr();
+        for (auto &[axiId, txn] : axiTransactions) {
+            if (txn.completed) {
+                continue;
             }
-
-            break;  // 找到匹配的事务
+            if (respAddr >= txn.startAddr &&
+                respAddr < txn.startAddr + txn.totalSize) {
+                processResponse(axiId, txn);
+                matched = true;
+                break;
+            }
         }
     }
 
     // 释放收到的 CHI 响应包
     delete pkt;
 
+    // TxnID 释放后，优先恢复之前因资源不足而中断的拆分
+    resumePendingSplits();
     // 如果之前阻塞了, 检查是否可以解除阻塞
-    if (blocked && !isBlocked()) {
-        blocked = false;
-        // 通知 AXI 侧可以重新发送请求
-        if (axiSlavePort.needRetry) {
-            axiSlavePort.needRetry = false;
-            axiSlavePort.sendRetryReq();
-            DPRINTF(AXI2CHIBridge,
-                    "Unblocked: sending retry to AXI upstream\n");
-        }
-    }
+    maybeUnblockAxi();
 
+    checkDrainAndExit();
     return true;
 }
 
@@ -906,9 +869,26 @@ AXI2CHIBridge::freeTxnId(unsigned id)
 bool
 AXI2CHIBridge::isBlocked() const
 {
-    // 被阻塞的条件: TxnID 耗尽 或 请求队列满
-    return (activeTxnCount >= maxTxnId) ||
-           (chiReqQueue.size() >= reqQueueSize);
+    // 被阻塞的唯一条件: TxnID 耗尽
+    // reqQueueSize 不应成为瓶颈，outstanding 由 TxnID 控制
+    return (activeTxnCount >= maxTxnId);
+}
+
+void
+AXI2CHIBridge::checkDrainAndExit()
+{
+    if (!requestLimitReached || drainExitIssued) {
+        return;
+    }
+
+    const size_t pendingReqs = pendingChiReqs();
+    const bool axiRespEmpty = axiRespQueue.empty();
+
+    if (pendingCountedAxiResponses == 0 &&
+        activeTxnCount == 0 && pendingReqs == 0 && axiRespEmpty) {
+        drainExitIssued = true;
+        exitSimLoop("AXI request limit reached and drained");
+    }
 }
 
 // ====================================================================
@@ -938,68 +918,88 @@ AXI2CHIBridge::enqueueCHIRequest(CHIRequest &req, unsigned priority)
  * 2. 按权重交替服务两个队列
  * Ref: CNBA Proposal - 加权轮询仲裁逻辑
  */
+Tick
+AXI2CHIBridge::nextReadyCHITick() const
+{
+    Tick next = MaxTick;
+    if (!chiReqQueue.empty()) {
+        next = std::min(next, chiReqQueue.front().scheduledTick);
+    }
+    if (!highPrioQueue.empty()) {
+        next = std::min(next, highPrioQueue.front().scheduledTick);
+    }
+    if (!lowPrioQueue.empty()) {
+        next = std::min(next, lowPrioQueue.front().scheduledTick);
+    }
+    return next;
+}
+
+// ====================================================================
+// QoS 调度器实现
+// Ref: CNBA Proposal Section 2.4 - QoS 调度 (优先级 + WRR)
+// ====================================================================
+
 bool
 AXI2CHIBridge::scheduleNextCHIRequest()
 {
+    enum class QueueSel { Normal, High, Low, None };
+    QueueSel selected = QueueSel::None;
     CHIRequest req;
-    bool found = false;
+    const Tick now = curTick();
+
+    auto isReady = [now](const CHIRequest &r) {
+        return r.scheduledTick <= now;
+    };
 
     if (!qosEnabled) {
-        // QoS 未开启，直接从普通队列取
-        if (!chiReqQueue.empty()) {
+        if (!chiReqQueue.empty() && isReady(chiReqQueue.front())) {
             req = chiReqQueue.front();
-            chiReqQueue.pop_front();
-            found = true;
+            selected = QueueSel::Normal;
         }
     } else {
-        // WRR 仲裁
-        // 高优先级优先: 若高优先级队列非空且还有配额
-        if (!highPrioQueue.empty() && wrrHighCounter < wrrHighWeight) {
-            req = highPrioQueue.front();
-            highPrioQueue.pop();
-            wrrHighCounter++;
-            found = true;
-        }
-        // 低优先级
-        else if (!lowPrioQueue.empty() && wrrLowCounter < wrrLowWeight) {
-            req = lowPrioQueue.front();
-            lowPrioQueue.pop();
-            wrrLowCounter++;
-            found = true;
-        }
-        // 重置计数器
-        else if (wrrHighCounter >= wrrHighWeight &&
-                 wrrLowCounter >= wrrLowWeight) {
+        bool highReady = !highPrioQueue.empty() && isReady(highPrioQueue.front());
+        bool lowReady = !lowPrioQueue.empty() && isReady(lowPrioQueue.front());
+
+        if (wrrHighCounter >= wrrHighWeight &&
+            wrrLowCounter >= wrrLowWeight) {
             wrrHighCounter = 0;
             wrrLowCounter = 0;
-            // 递归重试
-            return scheduleNextCHIRequest();
         }
-        // 只有一个队列有数据
-        else if (!highPrioQueue.empty()) {
+
+        if (highReady && wrrHighCounter < wrrHighWeight) {
             req = highPrioQueue.front();
-            highPrioQueue.pop();
-            found = true;
-        }
-        else if (!lowPrioQueue.empty()) {
+            selected = QueueSel::High;
+        } else if (lowReady && wrrLowCounter < wrrLowWeight) {
             req = lowPrioQueue.front();
-            lowPrioQueue.pop();
-            found = true;
+            selected = QueueSel::Low;
+        } else if (highReady) {
+            req = highPrioQueue.front();
+            selected = QueueSel::High;
+        } else if (lowReady) {
+            req = lowPrioQueue.front();
+            selected = QueueSel::Low;
         }
     }
 
-    if (found) {
-        // 发送 CHI 请求到下游
-        if (chiMasterPort.sendTimingReq(req.pkt)) {
-            DPRINTF(AXI2CHIBridge,
-                    "Sent CHI request: addr=%#x, size=%d, txnId=%d\n",
-                    req.pkt->getAddr(), req.pkt->getSize(), req.txnId);
-            return true;
-        } else {
-            // 下游忙，放回队列头部
-            chiReqQueue.push_front(req);
-            return false;
+    if (selected == QueueSel::None) {
+        return false;
+    }
+
+    if (chiMasterPort.sendTimingReq(req.pkt)) {
+        if (selected == QueueSel::Normal) {
+            chiReqQueue.pop_front();
+        } else if (selected == QueueSel::High) {
+            highPrioQueue.pop();
+            wrrHighCounter++;
+        } else if (selected == QueueSel::Low) {
+            lowPrioQueue.pop();
+            wrrLowCounter++;
         }
+
+        DPRINTF(AXI2CHIBridge,
+                "Sent CHI request: addr=%#x, size=%d, txnId=%d\n",
+                req.pkt->getAddr(), req.pkt->getSize(), req.txnId);
+        return true;
     }
 
     return false;
@@ -1023,6 +1023,8 @@ AXI2CHIBridge::trySendCHIRequest()
                    !lowPrioQueue.empty();
     if (hasMore) {
         if (scheduleNextCHIRequest()) {
+            resumePendingSplits();
+            maybeUnblockAxi();
             // 发送成功，如果还有更多请求，下一周期继续
             hasMore = !chiReqQueue.empty() || !highPrioQueue.empty() ||
                       !lowPrioQueue.empty();
@@ -1030,9 +1032,17 @@ AXI2CHIBridge::trySendCHIRequest()
                 schedule(sendCHIReqEvent, clockEdge(Cycles(1)));
             }
         } else {
-            // 发送失败: 标记等待重试，不调度
-            chiWaitingForRetry = true;
-            DPRINTF(AXI2CHIBridge, "trySendCHI: send failed, waiting for retry\n");
+            Tick next_ready = nextReadyCHITick();
+            if (next_ready != MaxTick && next_ready > curTick()) {
+                if (!sendCHIReqEvent.scheduled()) {
+                    schedule(sendCHIReqEvent, next_ready);
+                }
+            } else {
+                // 发送失败: 标记等待重试，不调度
+                chiWaitingForRetry = true;
+                DPRINTF(AXI2CHIBridge,
+                        "trySendCHI: send failed, waiting for retry\n");
+            }
         }
     }
 }
@@ -1051,6 +1061,14 @@ AXI2CHIBridge::trySendAXIResponse()
 
         if (axiSlavePort.sendTimingResp(pkt)) {
             axiRespQueue.pop_front();
+            bool countedResp = false;
+            if (!axiRespIsCounted.empty()) {
+                countedResp = axiRespIsCounted.front();
+                axiRespIsCounted.pop_front();
+            }
+            if (countedResp && pendingCountedAxiResponses > 0) {
+                pendingCountedAxiResponses--;
+            }
             DPRINTF(AXI2CHIBridge,
                     "Sent AXI response: addr=%#x\n", pkt->getAddr());
 
@@ -1069,6 +1087,8 @@ AXI2CHIBridge::trySendAXIResponse()
             if (!axiRespQueue.empty() && !sendAXIRespEvent.scheduled()) {
                 schedule(sendAXIRespEvent, clockEdge(Cycles(1)));
             }
+            maybeUnblockAxi();
+            checkDrainAndExit();
         } else {
             // 发送失败: 标记等待重试
             axiWaitingForRetry = true;

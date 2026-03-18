@@ -71,8 +71,8 @@ parser.add_argument(
 parser.add_argument(
     "--max-txn-id",
     type=int,
-    default=256,
-    help="Maximum outstanding TxnIDs (CF'20 uses 128, CNBA uses 256)",
+    default=32,
+    help="Maximum outstanding TxnIDs (shared by all bridge modes)",
 )
 
 parser.add_argument(
@@ -85,8 +85,8 @@ parser.add_argument(
 parser.add_argument(
     "--mem-latency",
     type=str,
-    default="30ns",
-    help="Memory access latency",
+    default="80ns",
+    help="Memory access latency (80ns = 80 cycles at 1GHz)",
 )
 
 parser.add_argument(
@@ -114,8 +114,8 @@ parser.add_argument(
 parser.add_argument(
     "--burst-size",
     type=int,
-    default=256,
-    help="AXI burst size in bytes (typical: 64, 128, 256)",
+    default=512,
+    help="AXI burst size in bytes (typical: 64, 128, 256, 512)",
 )
 
 parser.add_argument(
@@ -129,7 +129,19 @@ parser.add_argument(
     "--random-beat-size",
     action="store_true",
     default=False,
-    help="Randomize AXI beat size per request (cycle through 8/16/32B)",
+    help="Randomize AXI beat size per request (AxSIZE in [min..5])",
+)
+parser.add_argument(
+    "--min-axi-size",
+    type=int,
+    default=3,
+    help="Minimum AxSIZE value for random beat size (0=1B .. 5=32B, default 3=8B)",
+)
+parser.add_argument(
+    "--convert-time",
+    type=int,
+    default=5,
+    help="Bridge transaction conversion delay in cycles",
 )
 
 parser.add_argument(
@@ -239,7 +251,7 @@ def build_system(mode, args):
 
     # 设置系统 cache_line_size 为较大值，允许 TrafficGen 发送大突发包
     # 桥接器内部使用自己的 cache_line_size (64B) 进行拆分
-    system.cache_line_size = 256
+    system.cache_line_size = 512
 
     # ---- 创建内存 ----
     system.mem_ctrl = SimpleMemory(
@@ -260,9 +272,9 @@ def build_system(mode, args):
     # CHI 侧总线 (下游)
     system.chi_bus = NoncoherentXBar(
         width=32,
-        frontend_latency=1,
+        frontend_latency=0,
         forward_latency=0,
-        response_latency=1,
+        response_latency=0,
     )
 
     # ---- 创建 AXI2CHI 桥接器 ----
@@ -270,8 +282,12 @@ def build_system(mode, args):
         "cache_line_size": args.cache_line_size,
         "bridge_latency": args.bridge_latency,
         "axi_beat_size": args.axi_beat_size,
-        "random_axi_beat_size": args.random_beat_size,
+        "random_axi_beat_size": (
+            args.random_beat_size or args.traffic_pattern == "random"
+        ),
         "max_axi_requests": args.num_requests,
+        "convert_time": args.convert_time,
+        "min_axi_size": args.min_axi_size,
         "ranges": system.mem_ranges,
     }
 
@@ -280,7 +296,7 @@ def build_system(mode, args):
         bridge_params["use_baseline_logic"] = True
         bridge_params["use_naive_logic"] = False
         bridge_params["enable_merge_split"] = False
-        bridge_params["max_txn_id"] = min(args.max_txn_id, 128)
+        bridge_params["max_txn_id"] = args.max_txn_id
         bridge_params["qos_enabled"] = False
         print(
             f"[Config] Baseline mode (CF'20): "
@@ -320,7 +336,7 @@ def build_system(mode, args):
         bridge_params["use_baseline_logic"] = False
         bridge_params["use_naive_logic"] = True
         bridge_params["enable_merge_split"] = False
-        bridge_params["max_txn_id"] = min(args.max_txn_id, 128)
+        bridge_params["max_txn_id"] = args.max_txn_id
         bridge_params["qos_enabled"] = False
         print(
             f"[Config] Naive bridge mode: "
@@ -386,28 +402,26 @@ def create_tgen_config(args):
 
     mem_size = int(args.mem_size.replace("MB", "")) * 1024 * 1024
     read_pct = args.read_percent
-    period = 1000  # 1ns between requests
-    # 每个 STATE 持续时间: 让每种 burst size 平均分配 ~(num_requests/N) 个请求
-    # 7 种 burst size, 每个 STATE 只发几个请求后就转移
-    # 设为 period * 5 → 每个 STATE 发 ~5 个请求后转移
-    duration = period * 5
+    period = 1  # 1 tick → 尽可能快地发送请求（背靠背）
+    # 每个 STATE 持续时间: 短暂停留后切换，保证 burst size 混合
+    duration = period * 50  # 每个 STATE 发 ~50 个请求后转移
 
     # ===========================================================
-    # 代表性 AXI 突发大小 (bytes):
-    #   4B, 8B, 16B, 32B → 小突发
-    #     - 不跨 Cache Line 边界 → CNBA 可合并为 1 个 CHI 请求
-    #     - Baseline 也只生成 1 个 CHI 请求 (因为<=64B)
-    #     - 朴素桥可能拆成多个 (因为不按 CL 对齐)
-    #   64B → 恰好一个 Cache Line
-    #     - 所有模式均 1:1 转换
-    #   128B, 256B → 大突发 (跨 Cache Line 边界)
-    #     - Baseline: 拆为 2~4 个 CHI 请求 (按 64B 边界对齐)
-    #     - CNBA: 智能拆分 (计算实际跨 CL 数量)
-    #     - 朴素桥: 拆为 4~8 个 CHI 请求 (按 32B beat)
+    # 代表性 AXI 突发总大小 (bytes):
+    #   32B, 64B, 128B, 256B, 512B
+    #   与随机 AxSIZE (0-5) 组合，覆盖所有 AXI burst 参数组合
     #
-    # 注意: block_size 必须 <= system.cache_line_size (设为 256B)
+    # AXI Size 范围: AxSIZE = 0~5 (1B~32B per beat)
+    #   - Size 0: 1B per beat
+    #   - Size 1: 2B per beat
+    #   - Size 2: 4B per beat
+    #   - Size 3: 8B per beat
+    #   - Size 4: 16B per beat
+    #   - Size 5: 32B per beat
+    #
+    # 注意: block_size 必须 <= system.cache_line_size (设为 512B)
     # ===========================================================
-    burst_sizes = [4, 8, 16, 32, 64, 128, 256]
+    burst_sizes = [32, 64, 128, 256, 512]
 
     config_lines = []
 
@@ -419,6 +433,7 @@ def create_tgen_config(args):
             )
 
     elif args.traffic_pattern == "random":
+        # 随机模式: AXI 总大小随机取 32/64/128/256/512B
         for i, bsize in enumerate(burst_sizes):
             config_lines.append(
                 f"STATE {i} {duration} RANDOM {read_pct} 0 {mem_size} "
@@ -455,12 +470,6 @@ def create_tgen_config(args):
         config_content += line + "\n"
 
     config_content += "INIT 0\n"
-
-    # 均匀随机转移: 每个 state 等概率转移到所有 state (包括自身)
-    for i in range(n):
-        for j in range(n):
-            prob = 1.0 / n
-            config_content += f"TRANSITION {i} {j} {prob:.6f}\n"
 
     # 均匀随机转移: 每个 state 等概率转移到所有 state (包括自身)
     for i in range(n):
@@ -542,6 +551,8 @@ def main():
     print(f"  Cache Line:     {args.cache_line_size}B")
     print(f"  Max TxnID:      {args.max_txn_id}")
     print(f"  Bridge Latency: {args.bridge_latency} cycles")
+    print(f"  Convert Time:   {args.convert_time} cycles")
+    print(f"  Mem Latency:    {args.mem_latency}")
     print(f"  Requests:       {args.num_requests}")
     print(f"  Read Percent:   {args.read_percent}%")
     print(f"{'='*60}\n")
@@ -549,7 +560,7 @@ def main():
     # 运行仿真
     # 桥接器在收到 max_axi_requests 个 AXI 请求后会调用 exitSimLoop 停止
     # sim_ticks 作为安全上限，防止永远不停
-    sim_ticks = args.num_requests * 1000000  # 充足的仿真时间上限
+    sim_ticks = args.num_requests * 100000000  # 充足的仿真时间上限
     exit_event = m5.simulate(sim_ticks)
     print(
         f"\nSimulation complete: {exit_event.getCause()} @ tick {m5.curTick()}"
