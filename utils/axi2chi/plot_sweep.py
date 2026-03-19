@@ -198,9 +198,15 @@ def main():
         default="m5out/plots",
         help="Output directory for plots",
     )
+    parser.add_argument(
+        "--prefix",
+        default="",
+        help="Directory name prefix for sweep experiments (e.g. 'conv_' for conv_exp5_*/conv_exp6_*)",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    pfx = args.prefix
 
     # ========== Memory Latency Sweep ==========
     lat_ns_values = [10, 20, 40, 80, 160]
@@ -209,9 +215,9 @@ def main():
     print("Collecting memory latency sweep data...")
     lat_data = collect_sweep(
         args.base_dir,
-        "exp5",
+        f"{pfx}exp5",
         param_values=lat_labels,
-        param_fmt=lambda mode, val: f"exp5_{mode}_{val}",
+        param_fmt=lambda mode, val: f"{pfx}exp5_{mode}_{val}",
     )
 
     # Convert x-axis to numeric ns for proper scaling
@@ -245,9 +251,9 @@ def main():
     print("Collecting TxnID sweep data...")
     tid_data = collect_sweep(
         args.base_dir,
-        "exp6",
+        f"{pfx}exp6",
         param_values=tid_values,
-        param_fmt=lambda mode, val: f"exp6_{mode}_tid{val}",
+        param_fmt=lambda mode, val: f"{pfx}exp6_{mode}_tid{val}",
     )
 
     print("Generating TxnID sweep plots...")

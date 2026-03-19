@@ -70,6 +70,11 @@ class AXI2CHIBridge(ClockedObject):
         3,
         "Minimum AxSIZE value for random beat size (0=1B .. 5=32B, default 3=8B)",
     )
+    traffic_pattern = Param.String(
+        "random",
+        "Traffic pattern: 'random' (uniform AxSIZE) or 'conv' "
+        "(5%% size=3, 10%% size=4, 85%% size=5)",
+    )
     max_axi_requests = Param.Unsigned(
         0,
         "Stop after receiving this many AXI requests and draining all in-flight "

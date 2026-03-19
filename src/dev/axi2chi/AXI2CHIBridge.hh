@@ -199,6 +199,7 @@ class AXI2CHIBridge : public ClockedObject
     const unsigned axiBeatSize;     // AXI 每beat字节数
     const bool randomAxiBeatSize;   // 是否随机化 beat 大小
     const unsigned minAxiSize;       // 随机 AxSIZE 最小值 (0..5)
+    const std::string trafficPattern; // 流量模式: "random" 或 "conv"
     const unsigned maxAxiRequests;  // 接收多少个 AXI 请求后结束仿真 (0=不限)
     const unsigned maxTxnId;        // 最大 CHI TxnID 数量 (默认 128)
     const Cycles bridgeLatency;     // 桥接处理延迟

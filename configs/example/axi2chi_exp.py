@@ -106,9 +106,9 @@ parser.add_argument(
 parser.add_argument(
     "--traffic-pattern",
     type=str,
-    default="linear",
-    choices=["linear", "random", "stride", "gemm", "conv2d"],
-    help="Memory access traffic pattern",
+    default="random",
+    choices=["random", "conv"],
+    help="Traffic pattern: random (uniform AxSIZE) or conv (5%% size=3, 10%% size=4, 85%% size=5)",
 )
 
 parser.add_argument(
@@ -283,8 +283,9 @@ def build_system(mode, args):
         "bridge_latency": args.bridge_latency,
         "axi_beat_size": args.axi_beat_size,
         "random_axi_beat_size": (
-            args.random_beat_size or args.traffic_pattern == "random"
+            args.random_beat_size or args.traffic_pattern in ("random", "conv")
         ),
+        "traffic_pattern": args.traffic_pattern,
         "max_axi_requests": args.num_requests,
         "convert_time": args.convert_time,
         "min_axi_size": args.min_axi_size,
@@ -425,44 +426,14 @@ def create_tgen_config(args):
 
     config_lines = []
 
-    if args.traffic_pattern in ("linear", "stride"):
-        for i, bsize in enumerate(burst_sizes):
-            config_lines.append(
-                f"STATE {i} {duration} LINEAR {read_pct} 0 {mem_size} "
-                f"{bsize} {period} {period} 0"
-            )
-
-    elif args.traffic_pattern == "random":
-        # 随机模式: AXI 总大小随机取 32/64/128/256/512B
+    if args.traffic_pattern in ("random", "conv"):
+        # random 和 conv 的 TrafficGen 激励完全相同（随机地址+随机burst大小）
+        # 两者区别仅在于桥内部 AxSIZE 分布不同
         for i, bsize in enumerate(burst_sizes):
             config_lines.append(
                 f"STATE {i} {duration} RANDOM {read_pct} 0 {mem_size} "
                 f"{bsize} {period} {period} 0"
             )
-
-    elif args.traffic_pattern in ("gemm", "conv2d"):
-        # GEMM/Conv2D: 混合线性和随机，多种大小
-        half_mem = mem_size // 2
-        state_id = 0
-        for bsize in [64, 128, 256]:
-            # 线性读 (矩阵行读取)
-            config_lines.append(
-                f"STATE {state_id} {duration} LINEAR 100 0 {half_mem} "
-                f"{bsize} {period} {period} 0"
-            )
-            state_id += 1
-            # 随机读 (矩阵列读取)
-            config_lines.append(
-                f"STATE {state_id} {duration} RANDOM 100 {half_mem} {mem_size} "
-                f"{bsize} {period} {period} 0"
-            )
-            state_id += 1
-            # 线性写 (结果写回)
-            config_lines.append(
-                f"STATE {state_id} {duration} LINEAR 0 0 {half_mem} "
-                f"{bsize} {period} {period} 0"
-            )
-            state_id += 1
 
     n = len(config_lines)
     config_content = ""

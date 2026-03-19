@@ -68,6 +68,7 @@ AXI2CHIBridge::AXI2CHIBridge(const Params &p)
       axiBeatSize(p.axi_beat_size),
       randomAxiBeatSize(p.random_axi_beat_size),
       minAxiSize(p.min_axi_size),
+      trafficPattern(p.traffic_pattern),
       maxAxiRequests(p.max_axi_requests),
       maxTxnId(p.max_txn_id),
       bridgeLatency(p.bridge_latency),
@@ -296,7 +297,19 @@ AXI2CHIBridge::handleAXIRequest(PacketPtr pkt)
     // 随机模式下 AxSIZE 在 [0, 5] 内均匀随机 (1/2/4/8/16/32B)
     unsigned effectiveBeat;
     if (randomAxiBeatSize) {
-        unsigned axiSize = random_mt.random<unsigned>(minAxiSize, 5);
+        unsigned axiSize;
+        if (trafficPattern == "conv") {
+            // 卷积模式: 5% size=3(8B), 10% size=4(16B), 85% size=5(32B)
+            unsigned roll = random_mt.random<unsigned>(0, 99);
+            if (roll < 5)
+                axiSize = 3;
+            else if (roll < 15)
+                axiSize = 4;
+            else
+                axiSize = 5;
+        } else {
+            axiSize = random_mt.random<unsigned>(minAxiSize, 5);
+        }
         effectiveBeat = 1U << axiSize;
     } else {
         effectiveBeat = axiBeatSize;
