@@ -202,15 +202,15 @@ def plot_latency_stall(results, output_dir):
     labels = [LABELS[k] for k in keys]
     colors = [COLORS[k] for k in keys]
 
-    # 左图: 平均延迟
-    latencies = [results[k].get("avgLatency", 0) for k in keys]
+    # 左图: 平均延迟 (ticks → cycles, ÷1000)
+    latencies = [results[k].get("avgLatency", 0) / 1000 for k in keys]
     bars1 = styled_bar(
         ax1,
         labels,
         latencies,
         colors,
         HATCHES,
-        "Average Latency (ticks)",
+        "Average Latency (cycles)",
         "Bridge Crossing Latency",
     )
     add_bar_labels(ax1, bars1, fmt=".0f")
@@ -338,15 +338,15 @@ def plot_combined_panel(results, output_dir):
     )
     add_bar_labels(axes[0, 1], bars)
 
-    # (c) 平均延迟
-    lat = [results[k].get("avgLatency", 0) for k in keys]
+    # (c) 平均延迟 (ticks → cycles, ÷1000)
+    lat = [results[k].get("avgLatency", 0) / 1000 for k in keys]
     bars = styled_bar(
         axes[1, 0],
         labels,
         lat,
         colors,
         HATCHES,
-        "Ticks",
+        "Cycles",
         "(c) Average Latency",
     )
     add_bar_labels(axes[1, 0], bars, fmt=".0f")
@@ -383,7 +383,7 @@ def plot_summary_table(results, output_dir):
         "CHI Requests",
         "CHI/AXI Ratio",
         "Throughput (GB/s)",
-        "Avg Latency (ticks)",
+        "Avg Latency (cycles)",
         "Stall Cycles",
         "Merge Count",
         "Split Count",
@@ -404,8 +404,8 @@ def plot_summary_table(results, output_dir):
                 row.append(f"{chi / axi:.3f}")
             elif row_label == "Throughput (GB/s)":
                 row.append(f"{v.get('throughput', 0) / 1e9:.2f}")
-            elif row_label == "Avg Latency (ticks)":
-                row.append(f"{v.get('avgLatency', 0):,.0f}")
+            elif row_label == "Avg Latency (cycles)":
+                row.append(f"{v.get('avgLatency', 0) / 1000:,.1f}")
             elif row_label == "Stall Cycles":
                 row.append(f"{v.get('robStallCycles', 0):,.0f}")
             elif row_label == "Merge Count":

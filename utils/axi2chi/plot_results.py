@@ -47,8 +47,8 @@ def plot_latency_comparison(
 
     metrics = ["avgLatency"]
     labels = ["Average Latency"]
-    base_vals = [baseline_stats.get(m, 0) for m in metrics]
-    cnba_vals = [cnba_stats.get(m, 0) for m in metrics]
+    base_vals = [baseline_stats.get(m, 0) / 1000 for m in metrics]
+    cnba_vals = [cnba_stats.get(m, 0) / 1000 for m in metrics]
 
     x = range(len(labels))
     width = 0.35
@@ -70,7 +70,7 @@ def plot_latency_comparison(
         edgecolor="black",
     )
 
-    ax.set_ylabel("Latency (ticks)", fontsize=12)
+    ax.set_ylabel("Latency (cycles)", fontsize=12)
     ax.set_title("Bridge Crossing Latency Comparison", fontsize=14)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=11)
@@ -229,7 +229,7 @@ def plot_ablation_study(results_dict, output_path="ablation_study.pdf"):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
     labels = list(results_dict.keys())
-    latencies = [v.get("avgLatency", 0) for v in results_dict.values()]
+    latencies = [v.get("avgLatency", 0) / 1000 for v in results_dict.values()]
     throughputs = [v.get("throughput", 0) for v in results_dict.values()]
     colors = ["#4472C4", "#ED7D31", "#70AD47"]
 
@@ -237,7 +237,7 @@ def plot_ablation_study(results_dict, output_path="ablation_study.pdf"):
     bars1 = ax1.bar(
         labels, latencies, color=colors[: len(labels)], edgecolor="black"
     )
-    ax1.set_ylabel("Average Latency (ticks)", fontsize=12)
+    ax1.set_ylabel("Average Latency (cycles)", fontsize=12)
     ax1.set_title("Ablation: Latency Impact", fontsize=13)
     ax1.grid(axis="y", alpha=0.3)
 
@@ -298,11 +298,11 @@ def plot_latency_sweep(sweep_results, output_path="latency_sweep.pdf"):
 
     latencies = sorted(sweep_results.keys())
     bl_vals = [
-        sweep_results[l].get("baseline", {}).get("avgLatency", 0)
+        sweep_results[l].get("baseline", {}).get("avgLatency", 0) / 1000
         for l in latencies
     ]
     cn_vals = [
-        sweep_results[l].get("cnba", {}).get("avgLatency", 0)
+        sweep_results[l].get("cnba", {}).get("avgLatency", 0) / 1000
         for l in latencies
     ]
 
@@ -326,7 +326,7 @@ def plot_latency_sweep(sweep_results, output_path="latency_sweep.pdf"):
     )
 
     ax.set_xlabel("Bridge Latency (cycles)", fontsize=12)
-    ax.set_ylabel("Average Transaction Latency (ticks)", fontsize=12)
+    ax.set_ylabel("Average Transaction Latency (cycles)", fontsize=12)
     ax.set_title("Latency Sensitivity Analysis", fontsize=14)
     ax.legend(fontsize=11)
     ax.grid(alpha=0.3)

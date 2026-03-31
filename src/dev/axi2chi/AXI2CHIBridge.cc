@@ -319,6 +319,12 @@ AXI2CHIBridge::handleAXIRequest(PacketPtr pkt)
     txn.endAddr = txn.startAddr + txn.totalSize - 1;
     txn.burstType = BURST_INCR;  // 默认 INCR
 
+    // QoS 优先级分类: totalSize <= 64B → 高优先级 (延迟敏感)
+    // 仅在 qosEnabled 时生效，否则 qosPriority 保持默认 0
+    if (qosEnabled) {
+        txn.qosPriority = (txn.totalSize <= 64) ? 1 : 0;
+    }
+
     // 如果不是 INCR 且在基准模式，报告不支持
     // Ref: CF'20 Paper - 仅支持 INCR 突发
     if (useBaselineLogic && txn.burstType != BURST_INCR) {
@@ -792,6 +798,15 @@ AXI2CHIBridge::handleCHIResponse(PacketPtr pkt)
             if (txn.countedForLimit) {
                 stats.latencyHist.sample(latency);
                 stats.totalLatency += latency;
+
+                // 分优先级延迟统计 (仅 QoS 开启时有意义)
+                if (txn.qosPriority > 0) {
+                    stats.highPrioCount++;
+                    stats.highPrioLatency += latency;
+                } else {
+                    stats.lowPrioCount++;
+                    stats.lowPrioLatency += latency;
+                }
             }
 
             PacketPtr respPkt = txn.origPkt;
@@ -1157,6 +1172,15 @@ AXI2CHIBridge::BridgeStats::BridgeStats(AXI2CHIBridge *parent)
                "Total read requests"),
       ADD_STAT(totalWrites, statistics::units::Count::get(),
                "Total write requests"),
+      // ---- Per-priority stats (QoS) ----
+      ADD_STAT(highPrioCount, statistics::units::Count::get(),
+               "Number of high-priority AXI requests (totalSize <= 64B)"),
+      ADD_STAT(highPrioLatency, statistics::units::Tick::get(),
+               "Total latency of high-priority requests"),
+      ADD_STAT(lowPrioCount, statistics::units::Count::get(),
+               "Number of low-priority AXI requests (totalSize > 64B)"),
+      ADD_STAT(lowPrioLatency, statistics::units::Tick::get(),
+               "Total latency of low-priority requests"),
       // ---- Histogram ----
       ADD_STAT(latencyHist, statistics::units::Tick::get(),
                "Distribution of bridge crossing latencies"),
@@ -1170,7 +1194,13 @@ AXI2CHIBridge::BridgeStats::BridgeStats(AXI2CHIBridge *parent)
                totalBytes / simSeconds),
       ADD_STAT(mergeRate, statistics::units::Ratio::get(),
                "Transaction merge rate (1 - chi_reqs/axi_reqs)",
-               1.0 - (totalChiRequests / totalAxiRequests))
+               1.0 - (totalChiRequests / totalAxiRequests)),
+      ADD_STAT(avgHighPrioLatency, statistics::units::Tick::get(),
+               "Average latency of high-priority requests",
+               highPrioLatency / highPrioCount),
+      ADD_STAT(avgLowPrioLatency, statistics::units::Tick::get(),
+               "Average latency of low-priority requests",
+               lowPrioLatency / lowPrioCount)
 {
     latencyHist
         .init(20);

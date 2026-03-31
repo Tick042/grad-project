@@ -390,6 +390,12 @@ class AXI2CHIBridge : public ClockedObject
         statistics::Scalar totalReads;
         statistics::Scalar totalWrites;
 
+        // ---- Per-priority stats (QoS) ----
+        statistics::Scalar highPrioCount;
+        statistics::Scalar highPrioLatency;
+        statistics::Scalar lowPrioCount;
+        statistics::Scalar lowPrioLatency;
+
         // ---- Histogram ----
         statistics::Histogram latencyHist;
 
@@ -397,6 +403,8 @@ class AXI2CHIBridge : public ClockedObject
         statistics::Formula avgLatency;
         statistics::Formula throughput;
         statistics::Formula mergeRate;
+        statistics::Formula avgHighPrioLatency;
+        statistics::Formula avgLowPrioLatency;
     };
 
     BridgeStats stats;

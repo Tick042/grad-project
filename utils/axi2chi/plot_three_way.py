@@ -119,14 +119,14 @@ def plot_all(results, output_dir, fmt="png"):
     plt.close()
     print(f"  Saved: req_amplification.{fmt}")
 
-    # ===== Figure 2: 平均延迟 =====
+    # ===== Figure 2: 平均延迟 (ticks → cycles, ÷1000) =====
     fig, ax = plt.subplots(figsize=(8, 5))
-    latencies = [v.get("avgLatency", 0) for v in results.values()]
+    latencies = [v.get("avgLatency", 0) / 1000 for v in results.values()]
     plot_bar(
         ax,
         labels,
         latencies,
-        "Average Latency (ticks)",
+        "Average Latency (cycles)",
         "Bridge Crossing Latency",
         colors,
     )
@@ -201,7 +201,7 @@ def plot_all(results, output_dir, fmt="png"):
         axes[0, 1],
         labels,
         latencies,
-        "Latency (ticks)",
+        "Latency (cycles)",
         "Average Latency",
         colors,
     )
